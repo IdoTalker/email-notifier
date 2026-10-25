@@ -3,8 +3,85 @@ import email
 import email.header
 import email.message
 import re
+from html.parser import HTMLParser
 
 from config import IMAP_SERVER, IMAP_PORT, BODY_PREVIEW_CHARS, MAX_EMAILS_PER_POLL
+
+# Inline styles that hide text from the human reader but not from a tag stripper — a classic
+# way to smuggle instructions to the model.
+_HIDDEN_STYLE_RE = re.compile(
+    r"display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0(?:\.0+)?\s*(?:;|$)"
+    r"|font-size\s*:\s*[01](?:\.\d+)?\s*(?:px|pt)?\s*(?:;|$)"
+    r"|(?<![-\w])color\s*:\s*(?:#fff\b|#ffffff\b|white\b|transparent\b)"
+    r"|(?:left|top|right|text-indent|margin-left|margin-top)\s*:\s*-\d{3,}"
+    r"|(?:max-)?height\s*:\s*0(?:px)?\s*(?:;|$)",
+    re.IGNORECASE,
+)
+# Same trick through a stylesheet: <style>.x{display:none}</style> ... <div class="x">
+_HIDDEN_CLASS_RE = re.compile(r"\.([\w-]+)\s*\{([^}]*)\}")
+_STYLE_BLOCK_RE = re.compile(r"<style[^>]*>(.*?)</style>", re.IGNORECASE | re.DOTALL)
+_VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
+_SKIP_TAGS = {"script", "style", "head", "title"}
+
+
+def _hidden_classes(raw_html: str) -> set[str]:
+    classes = set()
+    for block in _STYLE_BLOCK_RE.findall(raw_html):
+        for name, rules in _HIDDEN_CLASS_RE.findall(block):
+            if _HIDDEN_STYLE_RE.search(rules):
+                classes.add(name)
+    return classes
+
+
+class _VisibleTextParser(HTMLParser):
+    """Collects only the text a human would see, dropping hidden elements and their children."""
+
+    def __init__(self, hidden_classes: set[str]):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self._hidden_classes = hidden_classes
+        # Only tags with the same name as the hidden element count toward its nesting, so an
+        # unclosed <p> inside a hidden <div> can't swallow the rest of the email.
+        self._skip_tag = None
+        self._skip_depth = 0
+
+    def _is_hidden(self, tag, attrs) -> bool:
+        style = attrs.get("style") or ""
+        classes = set((attrs.get("class") or "").split())
+        return (
+            tag in _SKIP_TAGS
+            or "hidden" in attrs
+            or bool(_HIDDEN_STYLE_RE.search(style))
+            or bool(classes & self._hidden_classes)
+        )
+
+    def handle_starttag(self, tag, attrs):
+        if tag in _VOID_TAGS:
+            return
+        if self._skip_tag:
+            if tag == self._skip_tag:
+                self._skip_depth += 1
+            return
+        if self._is_hidden(tag, dict(attrs)):
+            self._skip_tag = tag
+            self._skip_depth = 1
+
+    def handle_endtag(self, tag):
+        if self._skip_tag and tag == self._skip_tag:
+            self._skip_depth -= 1
+            if not self._skip_depth:
+                self._skip_tag = None
+
+    def handle_data(self, data):
+        if not self._skip_tag:
+            self.parts.append(data)
+
+
+def _html_to_text(raw_html: str) -> str:
+    parser = _VisibleTextParser(_hidden_classes(raw_html))
+    parser.feed(raw_html)
+    parser.close()
+    return re.sub(r"\s+", " ", " ".join(parser.parts)).strip()
 
 
 def _decode_header_value(raw_value: str) -> str:
@@ -61,14 +138,13 @@ def _extract_body(msg: email.message.Message) -> str:
             else:
                 plain_parts.append(text)
 
+    # Prefer HTML: it's what mail clients render, so a plain-text alternative can say something
+    # the reader never sees.
+    if html_parts:
+        return _html_to_text(" ".join(html_parts))
+
     if plain_parts:
         return " ".join(plain_parts)
-
-    if html_parts:
-        raw_html = " ".join(html_parts)
-        clean = re.sub(r"<[^>]+>", " ", raw_html)
-        clean = re.sub(r"\s+", " ", clean).strip()
-        return clean
 
     return ""
 

@@ -1,8 +1,13 @@
-"""Quick functional test — run with: python run_tests.py"""
+"""Quick functional test — run with: python tests/run_tests.py"""
 import os
 import sys
+from pathlib import Path
 from dotenv import load_dotenv
 
+# Run from the project root so app modules, .env and seen_ids.json resolve
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+os.chdir(ROOT)
 load_dotenv()
 
 # Test 1: IMAP fetch

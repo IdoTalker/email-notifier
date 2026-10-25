@@ -4,3 +4,4 @@ seen_ids.json
 __pycache__/
 *.pyc
 =*
+tests/results/
